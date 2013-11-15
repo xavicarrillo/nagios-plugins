@@ -1,0 +1,395 @@
+#!/usr/bin/ruby
+####
+# Maintainer: Jakub Pastuszek <jakubp@domain.com>
+#
+# For latest version do: svn export svn://home/admin/nagios/plugins/swisscom/check_swiftmq
+# If you upgrade this script pleas e-mail me a patch or ask for write allowed subversion account.
+#
+# (c)2006 Newbay Software Ltd.
+##
+
+$swiftmq_root = "/usr/local/swiftmq"
+
+$clis_sh_utility = "#{$swiftmq_root}/scripts/unix/clis.sh"
+
+#for HA version
+$hastate_path = "#{$swiftmq_root}/haspool/instance?/ha.state" 
+
+###################
+
+require 'rexml/document'
+require 'tempfile'
+require 'optparse'
+require 'ostruct'
+require 'timeout'
+
+class Status
+	def initialize(exit_code, exit_msg)
+		@exit_code = exit_code
+		@exit_msg = exit_msg
+	end
+
+	def quit(msg, preformance = nil)
+		out = @exit_msg + " - " + msg.to_s
+		if preformance and not preformance.empty?
+			out << " |"
+			preformance.each do | p |
+			 	out << " " + p.to_s
+			end
+		end
+		puts out
+		exit @exit_code
+	end
+end
+
+STATE_OK = Status.new(0,"OK")
+STATE_WARNING = Status.new(1,"WARNING");
+STATE_CRITICAL = Status.new(2,"CRITICAL");
+STATE_UNKNOWN = Status.new(3,"UNKNOWN");
+STATE_DEPENDENT = Status.new(4,"DEPENDENT");
+
+class PerformanceData
+	class PerformanceDataException < Exception
+	end
+
+	class UnitTypeException < PerformanceDataException
+	end
+
+	def initialize(label, value, units = nil, warn = nil, crit = nil, min = nil, max = nil)
+		@label = label
+		@value = value
+		@units = units
+		@warn = warn
+		@crit = crit
+		@min = min
+		@max = max
+
+		raise UnitTypeException.new if not [nil, :seconds, :percentage, :B, :KB, :MB, :TB, :counter].include? @units
+	end
+
+	def to_s
+		units = case @units
+			when nil then ""
+			when :seconds then "s"
+			when :percentage then "%"
+			when :B then @units.to_s
+			when :KB then @units.to_s
+			when :MB then @units.to_s 
+			when :TB then @units.to_s
+			when :counter then "c"
+		end
+
+		"'" + @label.gsub("'", "''") + "'=" + @value.to_s + units + ";" + if @warn then @warn.to_s else "" end + ";" + if @crit then @crit.to_s else "" end + ";" + if @min then @min.to_s else "" end + ";" + if @max then @max.to_s else "" end
+	end
+end
+
+class Options
+	def initialize
+		@options = OpenStruct.new
+
+		@options.normal_ha_state = nil
+		@options.queue = nil
+
+		@options.warning_queue_length = nil
+		@options.critical_queue_length = nil
+		@options.top_message_change_time = nil
+
+		@ha_states = [:nonha, :standalone, :active, :standby]
+	
+	end
+
+	def parse
+		@opts = OptionParser.new do |opts|
+			opts.separator ""
+			opts.separator "Checks for SwifmtMQ availability and number of messages in given queue"
+			opts.separator ""
+
+			opts.on("-s", "--ha-state HA_STATE", @ha_states, "Checks if SwiftMQ is in given mode",
+				"  (#{@ha_states.join(',')})") do |val|
+				@options.normal_ha_state = val
+        		end
+
+			opts.on("-q", "--queue-name STRING", "JMS queue to check") do |val|
+				@options.queue = val
+        		end
+
+			opts.on("-w", "--warning-queue-length INTEGER", Integer, "Messages count WARNING level") do |val|
+				@options.warning_queue_length = val
+        		end
+
+			opts.on("-c", "--critical-queue-length INTEGER", Integer, "Messages count CRITICAL level") do |val|
+	          		@options.critical_queue_length = val
+        		end
+
+			opts.on("-t", "--top-message-change-time INTEGER", Integer, "Seconds for top message hasn't changes that will generate WARNING if queue is not empty and CRITICAL if number of messages is over warning level") do |val|
+	          		@options.top_message_change_time = val
+        		end
+
+			opts.separator ""
+
+			opts.on("-h", "--help", "Show this message") do
+				puts usage
+				exit
+			end
+
+			opts.separator ""
+			opts.separator "Example: #{$0} -s active -q FoneblogPostQueue -w 80 -c 200 -t 300"
+
+		end
+	 	@opts.parse!(ARGV)
+
+		@options.normal_ha_state
+
+		if @options.queue
+			raise OptionParser::ParseError.new("no --warning-queue-length given") if not @options.warning_queue_length
+			raise OptionParser::ParseError.new("no --critical-queue-length given") if not @options.critical_queue_length
+			raise OptionParser::ParseError.new("--warning-queue-length grater than --critical-queue-length") if @options.warning_queue_length > @options.critical_queue_length
+		end
+ 
+		raise OptionParser::ParseError.new("no --queue-name given")  if (@options.warning_queue_length or @options.critical_queue_length or @options.top_message_change_time) and not @options.queue
+
+		@options
+	end
+
+	def usage
+		@opts.to_s
+	end
+end
+
+class SwiftMQ
+	class SwiftMQException < Exception
+	end
+	
+	class NotRunningException < SwiftMQException
+	end
+
+	class CantConnectException < SwiftMQException
+	end
+	
+	class QueueNotFoundException < SwiftMQException
+	end
+
+	class QueueLengthCheckingErrorException < SwiftMQException
+	end
+
+	class CliUtilityNotFoundException < SwiftMQException
+	end
+
+	class QueueIsEmptyException < SwiftMQException
+	end
+
+	def initialize()
+		@ha_state = nil
+		@running = nil
+		@has_queue_cache = []
+		@queue_length_cache = {}
+		@can_connect_cache = nil
+
+		## strings that can be found in `ps -Af` output
+		@swismq_id_string = "com.swiftmq.*Router"
+		@swismq_ha_id_string = "com.swiftmq.HARouter"
+		@swismq_nonha_id_string = "com.swiftmq.Router"
+	end
+
+	def ha_state(cache = true)
+		if @ha_state and cache then return @ha_state end
+		raise NotRunningException.new if not running?
+
+		`ps -Af | grep #{@swismq_ha_id_string} | grep -v grep`
+		if $? == 0 
+			Dir.glob($hastate_path).each do |file_path|
+				File::open(file_path) do |file|
+					case file.read
+						when "ACTIVE"
+							return @ha_state = :active
+						when "STANDBY"
+							return @ha_state = :standby
+						when "STANDALONE"
+							return @ha_state = :standalone
+					end
+				end
+			end
+		end
+
+		`ps -Af | grep #{@swismq_nonha_id_string} | grep -v grep`
+		if $? == 0 
+			return @ha_state = :nonha
+		end
+
+		@ha_state = :unknown
+	end
+
+	def can_connect?(cache = true)
+		if @can_connect_cache and cache
+			return @can_connect_cache
+		end
+
+		begin
+			exec_cli(["sr router1", "exit"])
+			@can_connect_cache = true
+		rescue CantConnectException
+			@can_connect_cache = false
+		end
+
+		@can_connect_cache
+	end
+
+	def running?(cache = true)
+		if @running and cache
+			return @running
+		end
+
+		`ps -Af | grep #{@swismq_id_string} | grep -v grep`
+		if $? == 0 
+			@running = true
+		else 
+			@running = false
+		end
+
+		@running
+	end
+
+	def queue_length(queue, cashed = true)
+		if @queue_length_cache.has_key?(queue) and cashed
+			return @queue_length_cache[queue]
+		end
+
+		raise NotRunningException.new if not running?
+
+		out = exec_cli(["sr router1", "lc sys$queuemanager/usage/#{queue}", "exit"])
+
+		raise QueueNotFoundException.new if not out.include?("Active Queue")
+
+		length = nil
+
+		out.each_line do |line|
+			if not line.include?("messagecount") then next end
+			length = line[/[\d]*\b$/]
+			break
+		end
+
+		raise QueueLengthCheckingErrorException.new(out) if length.nil? or length.empty?
+		length = length.to_i
+		@queue_length_cache[queue] = length
+		length
+	end
+
+	def top_message_time(queue)
+		message_xml = exec_cli(["sr router1", "cc sys$queuemanager/usage", "view #{queue} 0 0", "exit"])
+		message = REXML::Document.new(message_xml)
+
+		raise QueueNotFoundException.new if not message.elements['result']
+		raise QueueIsEmptyException.new if message.elements['result'].elements.empty? == true
+
+		Time.now - Time.at(message.elements['result/message/jms-header/JMSTimestamp'].text.to_i / 1000)
+	end
+
+private
+	def exec_cli(cli_commands)
+		t = Tempfile.new("nagios_jmpq_check_cli")
+		cli_commands.each do |command|
+			t << command + "\n"
+		end
+		t.close
+
+		out = `#{$clis_sh_utility} #{t.path}`
+
+		raise CliUtilityNotFoundException.new if $? == 32512
+		raise CantConnectException.new if out.include?("unable to connect")
+
+		out 
+	end
+end
+
+begin
+	options = Options.new.parse
+
+	performance = []
+	msg = ""
+
+	Timeout::timeout(20) {
+		swiftmq = SwiftMQ.new
+
+		STATE_CRITICAL.quit("No SwiftMQ process found") if not swiftmq.running?
+		msg = "SwiftMQ is running"
+	
+		# Check HA state
+		if options.normal_ha_state
+			STATE_UNKNOWN.quit("SwiftMQ is running but HA state is unknown") if swiftmq.ha_state == :unknown
+	
+			STATE_UNKNOWN.quit("Found HA version of SwiftMQ running but normal HA state given is 'nonha'") if swiftmq.ha_state != :nonha and options.normal_ha_state == :nonha
+			STATE_UNKNOWN.quit("Found non HA version of SwiftMQ running but normal HA state given is not 'nonha'") if swiftmq.ha_state == :nonha and options.normal_ha_state != :nonha
+	
+	
+			if options.normal_ha_state != :nonha
+				if swiftmq.ha_state != options.normal_ha_state
+					msg << " in not %s mode (%s mode)" % [options.normal_ha_state.to_s.upcase, swiftmq.ha_state.to_s.upcase]
+				else
+					msg << " (%s mode)" % swiftmq.ha_state.to_s.upcase
+				end
+			end
+	
+		end
+	
+		# Finishing if we are in stndby mode
+		if swiftmq.ha_state == :standby
+			STATE_WARNING.quit(msg) if options.normal_ha_state and swiftmq.ha_state != options.normal_ha_state
+			STATE_OK.quit(msg)
+		end
+	
+		# Checking for queue length
+		if options.queue
+			queue_length = swiftmq.queue_length(options.queue)
+	
+			performance << PerformanceData.new("Messages in queue", queue_length, :counter, options.warning_queue_length, options.critical_queue_length, 0)
+		
+			msg << ": #{options.queue}: #{queue_length.to_s}"
+	
+			if queue_length == 1
+				msg << " message"
+			else
+				msg << " messages"
+			end
+		
+			if queue_length > 0
+				top_message_time = swiftmq.top_message_time(options.queue).to_i
+				msg << ", top message has not changed for %d secconds" % top_message_time
+	
+				STATE_CRITICAL.quit(msg, performance) if queue_length >= options.critical_queue_length
+				STATE_CRITICAL.quit(msg, performance) if options.top_message_change_time and top_message_time >= options.top_message_change_time and queue_length >= options.warning_queue_length
+	
+				STATE_WARNING.quit(msg, performance) if options.top_message_change_time and top_message_time >= options.top_message_change_time
+				STATE_WARNING.quit(msg, performance) if queue_length >= options.warning_queue_length
+			end
+		# Just check for connection
+		else
+			raise SwiftMQ::CantConnectException if not swiftmq.can_connect?
+		end
+	
+		# We are done
+		STATE_WARNING.quit(msg, performance) if options.normal_ha_state and swiftmq.ha_state != options.normal_ha_state
+		STATE_OK.quit(msg, performance)
+	}
+
+rescue SwiftMQ::QueueNotFoundException
+	STATE_UNKNOWN.quit("Queue '#{options.queue}' not found")
+
+rescue SwiftMQ::CantConnectException
+	STATE_WARNING.quit(msg + ", not accepting new connections")
+
+rescue SwiftMQ::CliUtilityNotFoundException
+	STATE_UNKNOWN.quit("File '#{$clis_sh_utility}' not found or executable CLI command")
+
+rescue Timeout::Error
+	STATE_WARNING.quit(msg + ', chect Timed Out', performance)
+
+rescue SystemExit => e
+	raise
+
+rescue OptionParser::ParseError => e
+	STATE_UNKNOWN.quit("Argument error: " + e.to_s)
+
+rescue Exception => e
+	STATE_WARNING.quit("Unhandled exception: #{e.class}: #{e}: #{e.backtrace.join(" <= ")}")
+end
+

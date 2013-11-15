@@ -1,0 +1,547 @@
+#! /usr/bin/perl -w
+
+# Check Diskspace via SNMP.
+# Plugin uses UCD SNMP MIB (1.3.6.1.4.1.2021).
+# Used in net-snmp packages on linux.
+#
+# Copyright (C) 2007 by Herbert Stadler
+# email: h.stadler@surfeu.at
+
+# License Information:
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License 
+# along with this program; if not, see <http://www.gnu.org/licenses/>. 
+#
+#
+
+############################################################################
+
+
+use POSIX;
+use strict;
+use Getopt::Long;
+use lib "/usr/lib/nagios/plugins";
+use lib "/usr/lib64/nagios/plugins";
+use utils qw(%ERRORS);
+
+use Net::SNMP qw(oid_lex_sort oid_base_match);
+
+my ($opt_version,$opt_help,$opt_verbose);
+my ($opt_timeout,$opt_license);
+my ($opt_hostname,$opt_community,$opt_port,$opt_snmpvers);
+my ($opt_username,$opt_authpasswd,$opt_authproto);
+my ($opt_privpasswd,$opt_privproto);
+my ($PROGNAME,$REVISION);
+my ($state,$msg);
+
+use constant DEFAULT_TIMEOUT		=>15;
+use constant DEFAULT_PORT    		=>161;
+use constant DEFAULT_COMMUNITY  	=>"public";
+use constant DEFAULT_SNMPVERS 		=>"2";
+use constant DEFAULT_PRIVPROTO		=>"DES";
+use constant DEFAULT_AUTHPROTO		=>"MD5";
+
+#  UCD SNMP MIB 
+my $dskTable     			="1.3.6.1.4.1.2021.9";
+my  $dskEntry  				="1.3.6.1.4.1.2021.9.1";
+my   $dskIndex_tabular			="1.3.6.1.4.1.2021.9.1.1";
+my   $dskPath_tabular			="1.3.6.1.4.1.2021.9.1.2";
+my   $dskDevice_tabular			="1.3.6.1.4.1.2021.9.1.3";
+my   $dskMinimum_tabular		="1.3.6.1.4.1.2021.9.1.4";
+my   $dskMinPercent_tabular		="1.3.6.1.4.1.2021.9.1.5";
+my   $dskTotal_tabular			="1.3.6.1.4.1.2021.9.1.6";
+my   $dskAvail_tabular			="1.3.6.1.4.1.2021.9.1.7";
+my   $dskUsed_tabular			="1.3.6.1.4.1.2021.9.1.8";
+my   $dskPercent_tabular		="1.3.6.1.4.1.2021.9.1.9";
+my   $dskPercentNode_tabular		="1.3.6.1.4.1.2021.9.1.10";
+my   $dskErrorFlag_tabular		="1.3.6.1.4.1.2021.9.1.100";
+my   $dskErrorMsg_tabular		="1.3.6.1.4.1.2021.9.1.101";
+
+
+$ENV{'PATH'}='';
+$ENV{'BASH_ENV'}=''; 
+$ENV{'ENV'}='';
+$PROGNAME = "check_disks_ucd";
+$REVISION = "1.1";
+
+# checking commandline arguments
+my $arg_status = check_args();
+if ($arg_status){
+  print "ERROR: some arguments wrong\n";
+  exit $ERRORS{"UNKNOWN"};
+}
+
+# set alarmhandler for timeout handling
+$SIG{'ALRM'} = sub {
+  print ("ERROR: plugin timed out after $opt_timeout seconds \n");
+  exit $ERRORS{"UNKNOWN"};
+};
+
+alarm($opt_timeout);
+
+# let's see if the server wants to speak with us
+my ($snmp_session,$snmp_error)=open_snmp_session($opt_hostname);
+if ( ! defined ($snmp_session)) {
+  print "ERROR: Could not open connection: $snmp_error \n";
+  exit $ERRORS{'UNKNOWN'};
+}
+
+#  get dskTable
+my $p_dskTable=get_table ($dskTable);
+
+$snmp_session->close;
+
+if ( $opt_verbose ) {
+  print_dskTable ();
+}
+
+# set default values for program exit
+$msg = "DISKS OK - No Problems found ";
+$state = $ERRORS{'OK'};
+
+my $l_tmsg;
+foreach my $l_key (oid_lex_sort(keys(%$p_dskTable))){
+  if (!(oid_base_match($dskIndex_tabular,$l_key))) {
+    next;
+  }
+  my $l_val=$p_dskTable->{$l_key};
+  if ( $p_dskTable->{$dskErrorFlag_tabular.".".$l_val} == 1 ){
+    $state = $ERRORS{'CRITICAL'};
+    create_msg($p_dskTable->{$dskErrorMsg_tabular.".".$l_val},\$l_tmsg);
+  }
+}
+
+if ($state == $ERRORS{'WARNING'}){
+  $msg = "DISKS WARNING - ".$l_tmsg;
+}elsif ($state == $ERRORS{'CRITICAL'}){
+  $msg = "DISKS CRITICAL - ".$l_tmsg;
+}
+
+# and now "over and out"
+
+print "$msg\n";
+exit $state;
+
+
+
+
+#--------------------------------------------------------------------------#
+# S U B R O U T I N E S                                                    #
+#--------------------------------------------------------------------------#
+
+sub open_snmp_session {
+  my ($l_host)=@_;
+
+  my ($snmp_session,$snmp_error);
+
+  # open SNMP Session to Server
+  if ( $opt_snmpvers eq "3" ) {
+    if ( defined ($opt_authpasswd)) {
+      if ( defined ($opt_privpasswd)) {
+	($snmp_session,$snmp_error)=Net::SNMP->session(
+	    -hostname 		=> 	$l_host,
+	    -port		=>	$opt_port || 161,
+	    -timeout		=>	2,
+	    -retries		=>	2,
+	    -maxmsgsize		=>	16384,
+	    -version		=>	$opt_snmpvers,
+	    -username		=> 	$opt_username,
+	    -authpassword	=> 	$opt_authpasswd,
+	    -authprotocol	=> 	$opt_authproto,
+	    -privpassword	=> 	$opt_privpasswd,
+	    -privprotocol	=> 	$opt_privproto,
+	    );
+      } else {
+	($snmp_session,$snmp_error)=Net::SNMP->session(
+	    -hostname 		=> 	$l_host,
+	    -port		=>	$opt_port || 161,
+	    -timeout		=>	2,
+	    -retries		=>	2,
+	    -maxmsgsize		=>	16384,
+	    -version		=>	$opt_snmpvers,
+	    -username		=> 	$opt_username,
+	    -authpassword	=> 	$opt_authpasswd,
+	    -authprotocol	=> 	$opt_authproto,
+	    );
+      } 
+    } else {
+	($snmp_session,$snmp_error)=Net::SNMP->session(
+	    -hostname 		=> 	$l_host,
+	    -port		=>	$opt_port || 161,
+	    -timeout		=>	2,
+	    -retries		=>	2,
+	    -maxmsgsize		=>	16384,
+	    -version		=>	$opt_snmpvers,
+	    -username		=> 	$opt_username,
+	    );
+    }
+  } else {
+    ($snmp_session,$snmp_error)=Net::SNMP->session(
+    	-hostname 	=> 	$l_host,
+	-community 	=> 	$opt_community || 'public',
+	-port		=>	$opt_port || 161,
+	-timeout	=>	2,
+	-retries	=>	2,
+	-maxmsgsize	=>	16384,
+	-version	=>	$opt_snmpvers,
+	);
+  }
+  return ($snmp_session,$snmp_error);
+}
+
+sub  create_msg {
+  my ($l_txt,$l_msg)=@_;
+
+  if (! defined $l_txt) {return};
+
+  if (defined $$l_msg) {
+    $$l_msg.=", ";
+  }
+  $$l_msg.=$l_txt;
+}
+
+sub get_table {
+  my ($l_oid)=@_;
+
+  my $l_snmp_result=$snmp_session->get_table(
+  	-baseoid 	=>	$l_oid
+  	);
+
+  if ( ! defined ($l_snmp_result)) {
+    print "ERROR: get_table: ",$snmp_session->error,"\n";
+    $snmp_session->close;
+    exit $ERRORS{'UNKNOWN'};
+  }
+  return $l_snmp_result;
+}
+
+sub check_args {
+  Getopt::Long::Configure('bundling');
+  GetOptions
+	("V"   			=> \$opt_version,
+	 "version"   		=> \$opt_version,
+	 "L"   			=> \$opt_license, 
+	 "license"   		=> \$opt_license, 
+	 "v"   			=> \$opt_verbose, 
+	 "verbose"   		=> \$opt_verbose, 
+	 "h|?" 			=> \$opt_help,
+	 "help"   		=> \$opt_help,
+	 "t=i" 			=> \$opt_timeout, 
+	 "timeout=i" 		=> \$opt_timeout, 
+	 "H=s" 			=> \$opt_hostname, 
+	 "hostname=s" 		=> \$opt_hostname, 
+	 "C=s" 			=> \$opt_community, 
+	 "community=s" 		=> \$opt_community, 
+	 "p=i" 			=> \$opt_port, 
+	 "port=i" 		=> \$opt_port, 
+	 "s=s" 			=> \$opt_snmpvers, 
+	 "snmpvers=s" 		=> \$opt_snmpvers, 
+         "u=s"       		=> \$opt_username,
+         "username=s"       	=> \$opt_username,
+         "o=s"   		=> \$opt_authpasswd,
+         "authpass=s"   	=> \$opt_authpasswd,
+         "r=s"   		=> \$opt_authproto,
+         "authprot=s"   	=> \$opt_authproto,
+         "O=s"   		=> \$opt_privpasswd,
+         "privpass=s"   	=> \$opt_privpasswd,
+         "R=s"   		=> \$opt_privproto,
+         "privprot=s"   	=> \$opt_privproto,
+	 );
+
+  if ($opt_license) {
+    print_gpl($PROGNAME,$REVISION);
+    exit $ERRORS{'OK'};
+  }
+
+  if ($opt_version) {
+    print_revision($PROGNAME,$REVISION);
+    exit $ERRORS{'OK'};
+  }
+
+  if ($opt_help) {
+    print_help();
+    exit $ERRORS{'OK'};
+  }
+
+  if ( ! defined($opt_hostname)){
+    print "\nERROR: Hostname not defined\n\n";
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+
+  unless (defined $opt_snmpvers) {
+    $opt_snmpvers = DEFAULT_SNMPVERS;
+  }
+  if (($opt_snmpvers ne "1") && ($opt_snmpvers ne "2") && ($opt_snmpvers ne "3")) {
+    printf ("\nERROR: SNMP Version %s unknown\n",$opt_snmpvers);
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+
+  unless (defined $opt_timeout) {
+    $opt_timeout = DEFAULT_TIMEOUT;
+  }
+
+  unless (defined $opt_port) {
+    $opt_port = DEFAULT_PORT;
+  }
+
+  unless (defined $opt_community) {
+    $opt_community = DEFAULT_COMMUNITY;
+  }
+
+  if (defined $opt_privpasswd) {
+    unless (defined $opt_privproto) {
+      $opt_privproto = DEFAULT_PRIVPROTO;
+    }
+  }
+
+  if (defined $opt_authpasswd) {
+    unless (defined $opt_authproto) {
+      $opt_authproto = DEFAULT_AUTHPROTO;
+    }
+  }
+
+  if ($opt_snmpvers eq 3) {
+    unless (defined $opt_username) {
+      printf ("\nERROR: SNMP Version %s: please define username\n",$opt_snmpvers);
+      print_usage();
+      exit $ERRORS{'UNKNOWN'};
+    }
+  }
+
+  return $ERRORS{'OK'};
+}
+
+sub print_usage {
+  print "Usage: $PROGNAME [-h] [-L] [-t timeout] [-v] [-V] [-C community] [-p port] [-s 1|2|3] -H hostname  \n\n";
+  print "SNMP version 3 specific: [-u username] [-o authpass] [-r authprot] [-O privpass] [-R privprot]\n";
+}
+
+sub print_help {
+  print_revision($PROGNAME,$REVISION);
+  print "\n";
+  print_usage();
+  print "\n";
+  print "   Check Disks via UCD SNMP MIB\n";
+  print "   e.g: used on linux in net-snmp agent.\n\n";
+  print "-t (--timeout)      Timeout in seconds (default=",DEFAULT_TIMEOUT,")\n";
+  print "-H (--hostname)     Host to monitor\n";
+  print "-s (--snmpvers)     SNMP Version [1|2|3] (default=",DEFAULT_SNMPVERS,")\n";
+  print "-C (--community)    SNMP Community (default=",DEFAULT_COMMUNITY,")\n";
+  print "-p (--port)         SNMP Port (default=",DEFAULT_PORT,")\n";
+  print "-h (--help)         Help\n";
+  print "-V (--version)      Programm version\n";
+  print "-v (--verbose)      Print some useful information\n";
+  print "-L (--license)      Print license information\n";
+  print "\nSNMP version 3 specific arguments:\n";
+  print "-u (--username)     Security Name\n";
+  print "-o (--authpassword) Authentication password\n";
+  print "-r (--authprotocol) Authentication protocol [md5|sha]\n";
+  print "-O (--privpassword) Privacy password\n";
+  print "-R (--privprotocol) Privacy protocol [des|aes|3des]\n";
+  print "\n";
+}
+
+sub print_dskTable {
+  printtable  ("UCD Disk Table");
+  print       ("==============\n");
+  foreach my $l_key (oid_lex_sort(keys(%$p_dskTable))){
+    if (!(oid_base_match($dskIndex_tabular,$l_key))) {
+      next;
+    }
+    my $l_val=$p_dskTable->{$l_key};
+    printtabular("Disk Path",      $p_dskTable->{$dskPath_tabular.".".$l_val});
+    printtabular("Device",         $p_dskTable->{$dskDevice_tabular.".".$l_val});
+    printtabular("Minimum",        $p_dskTable->{$dskMinimum_tabular.".".$l_val});
+    printtabular("Min Percent",    $p_dskTable->{$dskMinPercent_tabular.".".$l_val});
+    printtabular("Total Size",     $p_dskTable->{$dskTotal_tabular.".".$l_val});
+    printtabular("Avail Size",     $p_dskTable->{$dskAvail_tabular.".".$l_val});
+    printtabular("Used Size",      $p_dskTable->{$dskUsed_tabular.".".$l_val});
+    printtabular("Pct Used",       $p_dskTable->{$dskPercent_tabular.".".$l_val});
+    printtabular("Pct Inode Used", $p_dskTable->{$dskPercentNode_tabular.".".$l_val});
+    printtabular("Error Flag",     $p_dskTable->{$dskErrorFlag_tabular.".".$l_val});
+    printtabular("Error Message",  $p_dskTable->{$dskErrorMsg_tabular.".".$l_val});
+    print ("\n");
+  }
+}
+
+sub printhead {
+  my ($l_head)=@_;
+
+  printf ("\n%-40s\n",$l_head);
+}
+
+sub printtable {
+  my ($l_head)=@_;
+
+  printf ("%-40s\n",$l_head);
+}
+
+sub printscalar {
+  my ($l_arg,$l_oid)=@_;
+
+  printf ("%-35s: %-30s\n",$l_arg,$l_oid);
+}
+
+sub printtabular {
+  my ($l_arg,$l_oid)=@_;
+
+  printf ("%-35s: %-30s\n",$l_arg,$l_oid);
+}
+
+
+sub print_gpl {
+  print <<EOD;
+
+  Copyright (C) 2007 by Herbert Stadler
+  email: h.stadler\@surfeu.at
+
+  License Information:
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 3 of the License, or
+  (at your option) any later version.
+ 
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+ 
+  You should have received a copy of the GNU General Public License 
+  along with this program; if not, see <http://www.gnu.org/licenses/>. 
+
+EOD
+
+}
+
+sub print_revision {
+  my ($l_prog,$l_revision)=@_;
+
+  print <<EOD
+
+$l_prog $l_revision, Copyright (C) 2007 Herbert Stadler
+
+This program comes with ABSOLUTELY NO WARRANTY; 
+for details type "$l_prog -L".
+EOD
+}
+
+
+#__END__
+
+
+=head1 NAME
+
+ check_disks_ucd
+
+=head1 DESCRIPTION
+
+ Check Disks via UCD SNMP MIB
+ e.g: used on linux in net-snmp agent
+
+ Plugin created for Nagios Monitoring.
+
+=head1 SYNOPSIS
+
+ check_disks_ucd -H <hostname> 
+
+ for more information concerning this plugin call:
+     check_disks_ucd -h
+     perldoc check_disks_ucd
+
+ more information concerning the configuration of the UCD SNMP Package:
+     man snmpd.conf
+
+
+=head1 AUTHOR
+
+ Herbert Stadler, Austria (h.stadler@surfeu.at)
+ December 2007
+
+ This plugin is a contribution to the nagios community.
+
+=head1 REQUIRED SOFTWARE
+
+ from search.cpan.org
+   Net::SNMP Package   	e.g: Net-SNMP-5.2.0.tar.gz
+
+=head1 HOW TO CHECK THE SERVER FUNCTIONALITY
+
+ Example:
+   snmpwalk 172.29.130.201 -v2c -c public enterprises.2021.9
+
+ should return some lines like these:
+
+  UCD-SNMP-MIB::dskIndex.1 = INTEGER: 1
+  UCD-SNMP-MIB::dskPath.1 = STRING: /
+  UCD-SNMP-MIB::dskDevice.1 = STRING: /dev/mapper/VolGroup00-LogVol00
+  UCD-SNMP-MIB::dskMinimum.1 = INTEGER: 10000000
+  UCD-SNMP-MIB::dskMinPercent.1 = INTEGER: -1
+  UCD-SNMP-MIB::dskTotal.1 = INTEGER: 11191892
+  UCD-SNMP-MIB::dskAvail.1 = INTEGER: 3656340
+  UCD-SNMP-MIB::dskUsed.1 = INTEGER: 6967028
+  UCD-SNMP-MIB::dskPercent.1 = INTEGER: 66
+  UCD-SNMP-MIB::dskPercentNode.1 = INTEGER: 9
+  UCD-SNMP-MIB::dskErrorFlag.1 = INTEGER: 1
+  UCD-SNMP-MIB::dskErrorMsg.1 = STRING: /: less than 10000000 free (= 3656340)
+
+ if not, check the configuration file 
+   - on linux (/etc/snmp/snmpd.conf)
+	# disks checks (Examples)
+        # disk PATH [ MINSPACE | MINPERCENT ]
+	disk / 10000000
+
+=head1 CONFIGURATION IN NAGIOS
+
+ Copy this plugin to the nagios plugin installation directory 
+ e.g.: /usr/lib(64)/nagios/plugin
+
+ COMMAND DEFINITION:
+
+ # "check_disks_ucd" command definition
+ define command{
+    command_name    check_disks_ucd
+    command_line    $USER1$/check_disks_ucd -H $HOSTADDRESS$
+    }
+
+
+=head1 PLUGIN HISTORY
+
+ Version 1.1 - 2007-12-19	fixed problem with **ePN 
+				(Missing right curly or square ...)
+ Version 1.0 - 2007-12-15	first release
+
+=head1 COPYRIGHT AND DISCLAIMER
+
+ Copyright (C) 2007 by Herbert Stadler
+ email: h.stadler@surfeu.at
+
+ License Information:
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 3 of the License, or
+ (at your option) any later version.
+ 
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License 
+ along with this program; if not, see <http://www.gnu.org/licenses/>. 
+ 
+
+=cut
+
+
+

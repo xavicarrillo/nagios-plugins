@@ -1,0 +1,416 @@
+#!/usr/bin/ruby
+####
+# Maintainer: Jakub Pastuszek <jakubp@domain.com>
+#
+# For latest version do: svn export svn://home/admin/nagios/plugins/check_pop_mailq
+# If you upgrade this script pleas e-mail me a patch or ask for write allowed subversion account.
+#
+# (c)2007 Newbay Software Ltd.
+##
+
+$nagios_writable_dir = "/tmp"
+$mail_spool_path = "/var/spool/mail"
+
+###################
+
+require 'net/pop'
+require 'digest/sha1'
+require 'yaml'
+require 'optparse'
+require 'ostruct'
+
+class Status
+	def initialize(exit_code, exit_msg)
+		@exit_code = exit_code
+		@exit_msg = exit_msg
+	end
+
+	def quit(msg, preformance = nil)
+		out = @exit_msg + " - " + msg.to_s
+		if preformance and not preformance.empty?
+			out << " |"
+			preformance.each do | p |
+			 	out << " " + p.to_s
+			end
+		end
+		puts out
+		exit @exit_code
+	end
+end
+
+STATE_OK = Status.new(0,"OK")
+STATE_WARNING = Status.new(1,"WARNING");
+STATE_CRITICAL = Status.new(2,"CRITICAL");
+STATE_UNKNOWN = Status.new(3,"UNKNOWN");
+STATE_DEPENDENT = Status.new(4,"DEPENDENT");
+
+class PerformanceData
+	class PerformanceDataException < Exception
+	end
+
+	class UnitTypeException < PerformanceDataException
+	end
+
+	def initialize(label, value, units = nil, warn = nil, crit = nil, min = nil, max = nil)
+		@label = label
+		@value = value
+		@units = units
+		@warn = warn
+		@crit = crit
+		@min = min
+		@max = max
+
+		raise UnitTypeException.new if not [nil, :seconds, :percentage, :B, :KB, :MB, :TB, :counter].include? @units
+	end
+
+	def to_s
+		units = case @units
+			when nil then ""
+			when :seconds then "s"
+			when :percentage then "%"
+			when :B then @units.to_s
+			when :KB then @units.to_s
+			when :MB then @units.to_s 
+			when :TB then @units.to_s
+			when :counter then "c"
+		end
+
+		"'" + @label.gsub("'", "''") + "'=" + @value.to_s + units + ";" + if @warn then @warn.to_s else "" end + ";" + if @crit then @crit.to_s else "" end + ";" + if @min then @min.to_s else "" end + ";" + if @max then @max.to_s else "" end
+	end
+end
+
+class Options
+	def initialize
+		@options = OpenStruct.new
+
+		@options.host = 'localhost'
+		@options.login = nil
+		@options.password = nil
+
+		@options.warning_length = nil
+		@options.critical_length = nil
+		@options.modification_time_delta = nil
+	
+	end
+
+	def parse
+		@opts = OptionParser.new do |opts|
+			opts.separator ""
+			opts.separator "Checks for mail queue length and if it was poped in some time interval using POP3 protocol and mailbox file (in #{$mail_spool_path})"
+			opts.separator ""
+
+			opts.on("-l", "--login STRING", "Login name") do |val|
+				@options.login = val
+        		end
+
+			opts.on("-p", "--password STRING", "Password") do |val|
+				@options.password = val
+        		end
+
+			opts.on("-h", "--host STRING", "POP3 server address to connect with") do |val|
+				@options.host = val
+        		end
+
+			opts.on("-w", "--warning-queue-length INTEGER", Integer, "Number of messages in queue that will generate WARNING") do |val|
+	          		@options.warning_length = val
+        		end
+
+			opts.on("-c", "--critical-queue-length INTEGER", Integer, "Number of messages in queue that will generate CRITICAL") do |val|
+	          		@options.critical_length = val
+        		end
+
+			opts.on("-t", "--top-message-change-time INTEGER", Integer, "Seconds since last mail queue pop that will generate WARNING if queue is not empty and CRITICAL if number of messages is over warning level") do |val|
+	          		@options.modification_time_delta = val
+        		end
+
+			opts.separator ""
+
+			opts.on("--help", "Show this message") do
+				puts usage
+				exit
+			end
+
+			opts.separator ""
+			opts.separator "Example: #{$0} -l blog_chili -p pass -w 100  -c 123 -t 100"
+
+		end
+	 	@opts.parse!(ARGV)
+
+		raise OptionParser::ParseError.new("no login given") if not @options.login
+		raise OptionParser::ParseError.new("no password given") if not @options.password
+		raise OptionParser::ParseError.new("no warning_length given") if not @options.warning_length
+		raise OptionParser::ParseError.new("no critical_length given") if not @options.critical_length
+
+		raise OptionParser::ParseError.new("critical-queue-length is less then warning-queue-length") if @options.critical_length < @options.warning_length
+
+		@options
+	end
+
+	def usage
+		@opts.to_s
+	end
+end
+
+class MailQueue
+	class MailQueueException < Exception
+	end
+
+	class CannotConnectException < MailQueueException
+	end
+
+	class BadLoginOrPasswordException < MailQueueException
+	end
+
+	class StateFileWriteError < MailQueueException
+	end
+	
+	class MailParseError < MailQueueException
+	end
+	
+	class QueueIsEmpty < MailQueueException
+	end
+	
+	class CannotDetermineWriteTime < IOError
+	end
+	
+	class State
+	end
+	
+	class EmptyState < State
+	end
+	
+	class NotEmptyState < State
+		attr_reader :timeStamp
+		attr_reader :messageId
+	
+		def initialize(time_stamp, message_id)
+			@timeStamp = time_stamp
+			@messageId = message_id
+		end
+	
+		def ==(state)
+			if messageId == state.messageId
+				return true
+			end
+			return false
+		end
+	end
+	
+	class UnknownState < State
+	end
+
+	def initialize(host, login, passwd, previous_state_file_path, mail_queue_file_path)
+		begin
+			@pop = Net::POP3.new(host)
+			@pop.start(login, passwd)
+		rescue SocketError => e
+			raise CannotConnectException.new(e.to_s)
+		rescue Errno::ECONNREFUSED => e
+			raise CannotConnectException.new(e.to_s)
+		rescue Net::POPAuthenticationError => e
+			raise BadLoginOrPasswordException.new(e.to_s)
+		end
+
+		@previous_state_file_path = previous_state_file_path
+		@mail_queue_file_path = mail_queue_file_path
+	end
+
+private
+	def countFolderData
+		if @cashed_count_folder_data then return @cashed_count_folder_data end
+
+		if @pop.mails.empty?
+			return 0
+		end
+
+		no = 0
+		@pop.mails.each do |mail|
+			#$stdout << mail.header << "\n"
+			if mail.header.include?("From: Mail System Internal Data <MAILER-DAEMON@")
+				no += 1
+				next
+			end
+			break
+		end
+
+		@cashed_count_folder_data = no
+	end
+
+	def topMessageId
+		if empty?
+			raise QueueIsEmpty.new
+		end
+
+		@pop.mails[countFolderData].header.each_line do | line | # next after data mails
+			if line.downcase.include? 'message-id:'
+				return line[(line.index("<") + 1)...line.index(">")]
+			end
+		end
+
+		raise MailParseError.new("No Message-Id foung in header!")
+	end
+
+	def previousQueueState
+		last_message_time = nil
+		last_message_id = nil
+
+		begin
+			File.open(@previous_state_file_path) do |f| 
+				last_message_time, last_message_id = YAML::load(f)
+			end
+		rescue 
+			return UnknownState.new
+		end
+
+		if last_message_id == "empty"
+			return EmptyState.new
+		end
+
+		return NotEmptyState.new(last_message_time, last_message_id)
+	end
+
+	def currentQueueState
+		if empty?
+			return EmptyState.new
+		end
+		return NotEmptyState.new(lastMessageWriteDelta, topMessageId)
+	end
+
+
+	def writeQueueState
+#		puts " + writeQueueState"
+		begin
+			top_message_id = topMessageId
+		rescue QueueIsEmpty
+			top_message_id = "empty"
+		end
+
+		last_message_write_delta = lastMessageWriteDelta
+
+		begin
+			File.open(@previous_state_file_path, File::CREAT|File::TRUNC|File::RDWR) do |f|
+				YAML::dump([Time.new.to_i - last_message_write_delta, top_message_id], f)
+			end
+		rescue => e
+			raise StateFileWriteError.new("Cannot write previosu state file: #{e}: #{e.backtrace.join(" <= ")}")
+		end
+	end
+
+	def lastMessageWriteDelta
+		if not File.exist?(@mail_queue_file_path)
+			raise CannotDetermineWriteTime.new("Cannot mtime file: No such file or directory - #{@mail_queue_file_path}")
+		end
+
+#		puts " + lastMessageWriteDelta: %d"  % (Time.new.to_i - File::Stat.new($mail_queue_file_path).mtime.to_i)
+
+		return Time.new.to_i - File::Stat.new(@mail_queue_file_path).mtime.to_i
+	end
+
+public
+	def length?(cache = true)
+		if @cashed_length and cache then return @cashed_length end
+
+		@cashed_length = @pop.mails.length - countFolderData
+		@cashed_length
+	end
+
+	def empty?
+		if length? == 0
+			return true
+		end
+
+		return false
+	end
+
+
+	def lastMessageChange
+		previous_state = previousQueueState
+		current_state = currentQueueState
+	
+#		puts previous_state
+#		puts current_state
+		
+		if previous_state.kind_of? UnknownState
+#			puts "prev: Unknown"
+#			puts "cur: *"
+			writeQueueState
+			return lastMessageWriteDelta
+		end
+
+		if previous_state.kind_of? EmptyState
+#			puts "prev: EmptyState"
+
+			if current_state.kind_of? NotEmptyState
+#				puts "cur: NonEmptyState"
+				writeQueueState
+			end
+
+#			puts "cur: EmptyState"
+			return lastMessageWriteDelta
+		end
+
+
+#		puts "prev: NotEmptyState"
+		if current_state.kind_of? NotEmptyState
+#			puts "cur: NonEmptyState"
+			
+			if current_state == previous_state
+#				puts "cur == prev"
+#				puts " + time_stamp: %d" % (Time.new.to_i - previous_state.timeStamp)
+				return Time.new.to_i - previous_state.timeStamp
+			end
+		end
+#		puts "cur: EmptyState"
+
+		writeQueueState
+		return lastMessageWriteDelta
+	end
+end
+
+begin
+	options = Options.new.parse
+
+	previous_state_file_path = $nagios_writable_dir + "/nagios_check_mqueue_" + options.login
+	mail_queue_file_path = $mail_spool_path + "/" + options.login
+
+	performance = []
+
+	queue = MailQueue.new(options.host, options.login, options.password, previous_state_file_path, mail_queue_file_path)
+
+	begin
+		last_change = queue.lastMessageChange
+		last_change_msg = "%d seconds ago" % last_change
+	rescue MailQueue::CannotDetermineWriteTime
+		last_change = nil
+		last_change_msg = "unknown"
+	end
+
+
+	performance << PerformanceData.new("Mails in queue", queue.length?, :counter, options.warning_length, options.critical_length, 0)
+
+	msg = "Mail queue #{options.login}: messages: #{queue.length?} last pop: #{last_change_msg}"
+
+	STATE_CRITICAL.quit(msg, performance) if last_change and options.modification_time_delta and last_change >= options.modification_time_delta and queue.length? >= options.warning_length
+	STATE_CRITICAL.quit(msg, performance) if queue.length? >= options.critical_length
+
+	STATE_WARNING.quit(msg, performance) if last_change and options.modification_time_delta and last_change >= options.modification_time_delta and not queue.empty?
+	STATE_WARNING.quit(msg, performance) if queue.length? >= options.warning_length
+
+	STATE_OK.quit(msg, performance)
+
+rescue MailQueue::CannotConnectException => e
+	STATE_CRITICAL.quit("Could not conntect to POP3 serve: " + e.to_s)
+
+rescue MailQueue::BadLoginOrPasswordException => e
+	STATE_UNKNOWN.quit("Incorect login or password: " + e.to_s)
+
+rescue SystemExit => e
+	raise
+
+rescue OptionParser::ParseError => e
+	STATE_UNKNOWN.quit("Argument error: " + e.to_s)
+
+rescue Exception => e
+	STATE_WARNING.quit("Unhandled exception: #{e.class}: #{e}: #{e.backtrace.join(" <= ")}")
+end
+

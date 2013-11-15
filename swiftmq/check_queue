@@ -1,0 +1,30 @@
+#!/bin/bash -x
+NAME=${1}
+CRITICAL=${2}
+
+FILE=/tmp/queuecheck.${NAME}
+CLI=/usr/local/custom_swiftmq/cli.sh
+
+echo sr router1 > ${FILE}
+echo lc sys\$queuemanager/usage/${NAME} >> $FILE
+echo exit >> $FILE
+
+RESULT=`/usr/local/custom_swiftmq/cli.sh ${FILE} | grep messagecount | sed 's/.*messagecount (R\/O)//' | sed 's/ //g'`
+
+if [ ${RESULT} -lt 20 ]; then
+	echo Queue ${NAME} OK - $RESULT
+	exit 0
+fi
+
+if [ ${RESULT} -lt 100 ]; then
+	echo Queue ${NAME} WARN - $RESULT
+	exit 1
+fi
+
+if [ ${RESULT} -gt ${CRITICAL} ]; then
+	echo Queue ${NAME} CRITICAL - $RESULT
+	exit 2
+fi
+
+echo Queue $1 UNKNOWN - $RESULT
+exit 3
