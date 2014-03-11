@@ -67,6 +67,13 @@ def GetTimeStampFromLogs(lastLine,logtype):
     TimeStampFromLogs = ' '.join(TimeStampFromLogs)+' '+str(Year)
     TimeStampFormat = "%b %d %H:%M:%S %Y"  #[monthname day Hour:Minute:Second Year]: Sep 25 16:22:20 2008
 
+  if logtype == "puppet":
+    # Mar 11 18:31:17 puppet-01 puppet-master[28759]: Compiled catalog for qa-opentel-12.hi.inet in environment default in 0.58 seconds
+    #Year = datetime.datetime.today().year
+    TimeStampFromLogs = lastLine.split()[0:3]
+    #TimeStampFromLogs = ' '.join(TimeStampFromLogs)+' '+str(Year)
+    TimeStampFormat = "%A %d %H:%M:%S"  #[weekday day Hour:Minute:Second]: Mar 11 18:31:17
+
   return TimeStampFromLogs, TimeStampFormat
 
 def exit(output,exitstatus,perfdata,minutes):
@@ -114,8 +121,8 @@ def main():
   if options.critical:
     if options.warning > options.critical:
       parser.error("critical has to be greater than warning")
-    if options.logtype not in ['tomcat','apache-access','apache-error','F5']:
-      parser.error("Logtype has to be either 'tomcat','apache-access','apache-error'")
+    if options.logtype not in ['tomcat','apache-access','apache-error','F5','puppet']:
+      parser.error("Logtype has to be either 'tomcat','apache-access','apache-error','F5' or 'puppet'")
 
   #Let's see if the string is there
   try: logfile = open(options.logfile, 'r')
